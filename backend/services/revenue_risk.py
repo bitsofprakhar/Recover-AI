@@ -17,6 +17,17 @@ payment's current state:
   actions.
 
 Every decision is audited and returned to the caller for the API response.
+
+Processing modes (see services.event_intake for the full contract):
+
+- mode="autonomous" (default): the complete Phase 4 behavior described above.
+- mode="manual" (POST /api/events/synthetic only): persist the payment, the
+  event and the recovery case in DETECTED, then STOP. Creation-time
+  ambiguities are NOT escalated here - they are recorded on the case and
+  deferred to the explicit agent run (POST /api/cases/{id}/agent/run), which
+  applies the same ambiguity triggers through the diagnosis context
+  assessment - and no background agent job is scheduled. Nothing else
+  differs: the same state machine, the same audits, the same rules.
 """
 from datetime import datetime, timedelta, timezone
 
@@ -99,7 +110,7 @@ def _escalate(db: Session, case: RecoveryCase, reason: str, trigger: dict) -> No
     )
 
 
-def evaluate(db: Session, payment: Payment, trigger_event: PaymentEvent) -> dict:
+def evaluate(db: Session, payment: Payment, trigger_event: PaymentEvent, mode: str = "autonomous") -> dict:
     trigger = {"trigger_event_id": trigger_event.event_id, "payment_id": payment.payment_id}
 
     if payment.status == PaymentStatus.CAPTURED:
@@ -123,6 +134,26 @@ def evaluate(db: Session, payment: Payment, trigger_event: PaymentEvent) -> dict
     active = _active_case_for_payment_or_order(db, payment)
     if active is not None:
         if _uncertain_failure_count(db, payment) >= settings.repeated_uncertain_failure_threshold:
+            if mode == "manual":
+                record(
+                    db,
+                    "risk.case_duplicate",
+                    case_id=active.id,
+                    payload={
+                        **trigger,
+                        "existing_case_id": active.id,
+                        "deferred_ambiguity": "AMBIGUOUS_REPEATED_UNCERTAIN",
+                    },
+                )
+                return {
+                    "decision": DECISION_DUPLICATE,
+                    "case_id": active.id,
+                    "reason": None,
+                    "revenue_at_risk": None,
+                    "mode": mode,
+                    "deferred_ambiguity": "AMBIGUOUS_REPEATED_UNCERTAIN",
+                    "note": "manual mode: the active case is left untouched; the ambiguity is deferred to explicit processing",
+                }
             _escalate(db, active, "AMBIGUOUS_REPEATED_UNCERTAIN", trigger)
             return {
                 "decision": DECISION_CASE_ESCALATED,
@@ -168,6 +199,21 @@ def evaluate(db: Session, payment: Payment, trigger_event: PaymentEvent) -> dict
             "ambiguity_reason": ambiguity,
         },
     )
+
+    if mode == "manual":
+        return {
+            "decision": DECISION_CASE_CREATED,
+            "case_id": case.id,
+            "reason": None,
+            "revenue_at_risk": str(revenue_at_risk),
+            "mode": mode,
+            "deferred_ambiguity": ambiguity,
+            "note": (
+                "manual mode: the case stays in DETECTED with no agent job scheduled; drive it with "
+                "POST /api/cases/{case_id}/agent/run"
+                + (" (creation-time ambiguity is deferred to the diagnosis context assessment)" if ambiguity else "")
+            ),
+        }
 
     if ambiguity is not None:
         _escalate(db, case, ambiguity, trigger)

@@ -3,11 +3,31 @@
 Pipeline: store raw event -> validate structure (malformed events are rejected
 with HTTP 422 and not stored) -> normalize (paise to rupees, status mapping,
 failure-reason taxonomy) -> semantic checks (unsupported event type, unmappable
-status, event/status mismatch are stored as REJECTED) -> idempotency (derived
-event_id, duplicates return DUPLICATE without reprocessing) -> payment upsert
-under the intake state machine (CAPTURED and FAILED are terminal) -> order
-status sync -> audit log entries -> revenue-at-risk evaluation (Phase 4
-deterministic case creation rules).
+status, event/status mismatch, unknown explicit order reference are stored as
+REJECTED) -> idempotency (derived event_id, duplicates return DUPLICATE without
+reprocessing) -> payment upsert under the intake state machine (CAPTURED and
+FAILED are terminal) -> order status sync -> audit log entries ->
+revenue-at-risk evaluation (Phase 4 deterministic case creation rules).
+
+A payment-creating event that explicitly references an order_id unknown to the
+merchant data is REJECTED (UNKNOWN_ORDER_REFERENCE): the reference contradicts
+our records and is never silently dropped. An event carrying no order reference
+at all is different: the payment is created orderless and the Phase 4 ambiguity
+trigger escalates it (AMBIGUOUS_MISSING_ORDER) for human review.
+
+Processing modes (reused by every caller; no duplicated logic):
+
+- mode="autonomous" (default): the complete pipeline - payment upsert, order
+  sync, risk evaluation with creation-time ambiguity escalation and the
+  scheduled background agent job. Used by webhooks, replay, the demo API,
+  the evaluation and every internal caller.
+- mode="manual": explicit test-data entry (POST /api/events/synthetic).
+  Persists the payment (an unresolvable order reference is kept in gateway
+  metadata instead of rejecting the event), persists the event, creates the
+  recovery case in DETECTED - the first valid non-terminal actionable state -
+  and STOPS. No creation-time escalation and no agent job: every pipeline
+  decision (diagnosis, escalation, scoring, gate, execution) is deferred to
+  the explicit manual workflow endpoints.
 """
 import hashlib
 import hmac
@@ -167,7 +187,7 @@ def _result(event: PaymentEvent, payment: Payment | None = None, processing_stat
     }
 
 
-def _apply_event(db: Session, event: PaymentEvent, n: dict) -> dict:
+def _apply_event(db: Session, event: PaymentEvent, n: dict, mode: str = "autonomous") -> dict:
     now = datetime.now(timezone.utc)
     payment = db.query(Payment).filter(Payment.payment_id == n["payment_ref"]).one_or_none()
 
@@ -175,6 +195,10 @@ def _apply_event(db: Session, event: PaymentEvent, n: dict) -> dict:
         order = None
         if n["order_ref"]:
             order = db.query(Order).filter(Order.order_id == n["order_ref"]).one_or_none()
+            if order is None and mode == "autonomous":
+                event.processing_status = "REJECTED"
+                event.reason = "UNKNOWN_ORDER_REFERENCE"
+                return _result(event)
         payment = Payment(
             payment_id=n["payment_ref"],
             order=order,
@@ -258,11 +282,11 @@ def _apply_event(db: Session, event: PaymentEvent, n: dict) -> dict:
     event.processed_at = now
     db.flush()
     result = _result(event, payment)
-    result["risk_evaluation"] = revenue_risk.evaluate(db, payment, event)
+    result["risk_evaluation"] = revenue_risk.evaluate(db, payment, event, mode)
     return result
 
 
-def process_envelope(db: Session, envelope: dict, source: str) -> dict:
+def process_envelope(db: Session, envelope: dict, source: str, mode: str = "autonomous") -> dict:
     n = normalize(envelope)
 
     existing = db.query(PaymentEvent).filter(PaymentEvent.event_id == n["event_id"]).one_or_none()
@@ -293,7 +317,7 @@ def process_envelope(db: Session, envelope: dict, source: str) -> dict:
         db.commit()
         return _result(event)
 
-    result = _apply_event(db, event, n)
+    result = _apply_event(db, event, n, mode)
     db.commit()
     return result
 

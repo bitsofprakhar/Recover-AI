@@ -20,21 +20,32 @@ class EventSpecRequest(BaseModel):
     created_at: int | None = None
 
 
-def _submit(spec: EventSpecRequest, db: Session, source: str) -> dict:
+def _submit(spec: EventSpecRequest, db: Session, source: str, mode: str = "autonomous") -> dict:
     try:
         envelope = build_envelope(db, spec.model_dump())
-        return process_envelope(db, envelope, source)
+        return process_envelope(db, envelope, source, mode)
     except MalformedEventError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
 
 @router.post("/synthetic")
 def create_synthetic_event(spec: EventSpecRequest, db: Session = Depends(get_db)) -> dict:
-    return _submit(spec, db, "SYNTHETIC")
+    """Create a synthetic payment event in MANUAL mode.
+
+    Persists the payment, the event and the recovery case (DETECTED, the first
+    valid non-terminal actionable state) and STOPS: no creation-time
+    escalation, no scheduled agent job, no autonomous processing. Drive the
+    case manually with POST /api/cases/{id}/agent/run, then gate/execute/
+    outcome/verify. The autonomous pipeline is unchanged for every other
+    caller (webhooks, replay, demo API, evaluation).
+    """
+    return _submit(spec, db, "SYNTHETIC", mode="manual")
 
 
 @router.post("/replay")
 def replay_event(spec: EventSpecRequest, db: Session = Depends(get_db)) -> dict:
+    """Replay an event through the full AUTONOMOUS pipeline (risk evaluation,
+    creation-time ambiguity escalation, scheduled background agent job)."""
     return _submit(spec, db, "REPLAY")
 
 
